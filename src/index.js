@@ -60,34 +60,20 @@ export default {
       return new Response('Missing messages', { status: 400, headers: CORS });
     }
 
-    let upstream;
-    try {
-      upstream = await fetch('https://api.anthropic.com/v1/messages', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-api-key': env.ANTHROPIC_API_KEY,
-          'anthropic-version': '2023-06-01',
-        },
-        body: JSON.stringify({
-          model: env.CLAUDE_MODEL,
-          max_tokens: 1024,
-          system: buildSystemPrompt(connectedContext),
-          messages,
-          stream: true,
-        }),
-      });
-    } catch (err) {
-      console.error('Anthropic fetch failed:', err.message);
-      return new Response('Upstream request failed', { status: 502, headers: CORS });
-    }
+    const chatMessages = [
+      { role: 'system', content: buildSystemPrompt(connectedContext) },
+      ...messages,
+    ];
 
-    if (!upstream.ok || !upstream.body) {
-      console.error('Anthropic error', upstream.status, await upstream.text());
+    let stream;
+    try {
+      stream = await env.AI.run(env.AI_MODEL, { messages: chatMessages, stream: true });
+    } catch (err) {
+      console.error('Workers AI error:', err.message);
       return new Response('Upstream error', { status: 502, headers: CORS });
     }
 
-    return new Response(upstream.body, {
+    return new Response(stream, {
       status: 200,
       headers: {
         ...CORS,
