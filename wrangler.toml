@@ -1,0 +1,6 @@
+name = "clarityai-chat"
+main = "src/index.js"
+compatibility_date = "2026-07-19"
+
+[vars]
+CLAUDE_MODEL = "claude-sonnet-5"
