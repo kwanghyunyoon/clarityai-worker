@@ -1,7 +1,7 @@
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Headers': 'Content-Type, X-ClarityAI-Key',
 };
 
 const BASE_PERSONA = `You are ClarityAI, a warm, grounded assistant. You help the user think
@@ -46,6 +46,13 @@ export default {
     const url = new URL(request.url);
     if (url.pathname !== '/chat' || request.method !== 'POST') {
       return new Response('Not Found', { status: 404, headers: CORS });
+    }
+
+    // Low-effort deterrent against casual/automated scraping of this public
+    // endpoint's Workers AI usage — not a strong security boundary, since
+    // EXPO_PUBLIC_* values ship in the client bundle and can be extracted.
+    if (env.CLARITYAI_SHARED_SECRET && request.headers.get('X-ClarityAI-Key') !== env.CLARITYAI_SHARED_SECRET) {
+      return new Response('Unauthorized', { status: 401, headers: CORS });
     }
 
     let body;
