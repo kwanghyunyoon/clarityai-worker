@@ -9,8 +9,21 @@ things through, answer general questions, and — when connected data is availab
 patterns in their mood and sleep. You are not a therapist and don't diagnose; you're a thoughtful
 companion. Keep replies concise and conversational.`;
 
-function buildSystemPrompt(connectedContext) {
+const LANGUAGE_NAMES = {
+  en: 'English',
+  ko: 'Korean',
+  es: 'Spanish',
+  hi: 'Hindi',
+};
+
+function buildSystemPrompt(connectedContext, lang) {
   let prompt = BASE_PERSONA;
+
+  const languageName = LANGUAGE_NAMES[lang];
+  if (languageName) {
+    prompt += `\n\nAlways reply in ${languageName}, written in its native script — never in English ` +
+      `and never romanized/transliterated, regardless of what language the conversation history is in.`;
+  }
 
   const mood = connectedContext?.mood;
   if (mood) {
@@ -62,13 +75,13 @@ export default {
       return new Response('Invalid JSON', { status: 400, headers: CORS });
     }
 
-    const { messages, connectedContext } = body;
+    const { messages, connectedContext, lang } = body;
     if (!Array.isArray(messages) || messages.length === 0) {
       return new Response('Missing messages', { status: 400, headers: CORS });
     }
 
     const chatMessages = [
-      { role: 'system', content: buildSystemPrompt(connectedContext) },
+      { role: 'system', content: buildSystemPrompt(connectedContext, lang) },
       ...messages,
     ];
 
