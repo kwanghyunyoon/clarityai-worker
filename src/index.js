@@ -16,8 +16,24 @@ const LANGUAGE_NAMES = {
   hi: 'Hindi',
 };
 
-function buildSystemPrompt(connectedContext, lang) {
+// Cost/prompt-size guard, not a security boundary — silently truncated rather
+// than rejected, since this is a low-stakes settings field, not user input
+// that needs strict validation.
+const CUSTOM_INSTRUCTIONS_MAX_LENGTH = 500;
+
+const RESPONSE_LENGTH_INSTRUCTIONS = {
+  concise: 'Keep this reply especially short — 1 to 2 sentences, no elaboration unless the user asks for more.',
+  detailed:
+    "The user has asked for more detailed responses. Feel free to elaborate, add relevant context, and use multiple paragraphs when helpful — don't artificially shorten your reply.",
+};
+
+function buildSystemPrompt(connectedContext, lang, customInstructions, responseLength) {
   let prompt = BASE_PERSONA;
+
+  if (customInstructions) {
+    const trimmed = customInstructions.slice(0, CUSTOM_INSTRUCTIONS_MAX_LENGTH);
+    prompt += `\n\nThe user has also asked you to keep this in mind: ${trimmed}`;
+  }
 
   const languageName = LANGUAGE_NAMES[lang];
   if (languageName) {
@@ -45,6 +61,13 @@ function buildSystemPrompt(connectedContext, lang) {
     prompt += `\n\nThe user has not connected any mood or sleep data. Chat normally; if it seems ` +
       `useful, you can mention that connecting clarity-in-calm or dreami data would let you give ` +
       `more personalized reflections.`;
+  }
+
+  // Last, deliberately: a per-reply formatting constraint benefits from being
+  // the most recently stated instruction in a long system prompt.
+  const lengthInstruction = RESPONSE_LENGTH_INSTRUCTIONS[responseLength];
+  if (lengthInstruction) {
+    prompt += `\n\n${lengthInstruction}`;
   }
 
   return prompt;
@@ -75,13 +98,13 @@ export default {
       return new Response('Invalid JSON', { status: 400, headers: CORS });
     }
 
-    const { messages, connectedContext, lang } = body;
+    const { messages, connectedContext, lang, customInstructions, responseLength } = body;
     if (!Array.isArray(messages) || messages.length === 0) {
       return new Response('Missing messages', { status: 400, headers: CORS });
     }
 
     const chatMessages = [
-      { role: 'system', content: buildSystemPrompt(connectedContext, lang) },
+      { role: 'system', content: buildSystemPrompt(connectedContext, lang, customInstructions, responseLength) },
       ...messages,
     ];
 
