@@ -5,5 +5,9 @@ compatibility_date = "2026-07-07"
 [ai]
 binding = "AI"
 
+[[kv_namespaces]]
+binding = "QUOTA_KV"
+id = "c5e581877d5f44688859b3ca19e4f138"
+
 [vars]
 AI_MODEL = "@cf/qwen/qwen3-30b-a3b-fp8"

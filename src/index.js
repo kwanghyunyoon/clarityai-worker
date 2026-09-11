@@ -1,7 +1,46 @@
 const CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, X-ClarityAI-Key',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+};
+
+// --- Tunables ---------------------------------------------------------------
+// Free-tier daily message allowance, keyed by device token.
+const FREE_DAILY_LIMIT = 25;
+// Assumed account-wide Workers AI daily allocation this Worker has to spend
+// across every device. UNMEASURED ESTIMATE, biased low deliberately: the
+// Workers FREE plan's daily allocation for this specific 30B model is not
+// yet known, and overshooting here means free users burn past the real
+// Cloudflare ceiling (a hard stop even paying users can't be spared from,
+// since there's no way to buy more on the Free plan) — undershooting only
+// means the soft gate below trips early, which is safe and just needs
+// raising once real neuron usage from the tester period is in.
+const DAILY_AI_BUDGET = 300;
+// Once cumulative spend today reaches this fraction of DAILY_AI_BUDGET, free
+// (non-credit-spending) requests get the "at capacity" response instead of a
+// model call, so free traffic can't starve paying devices near the ceiling.
+const CAPACITY_RESERVE_THRESHOLD = 0.7;
+// Registration abuse guard: device tokens minted per IP per UTC day.
+const MAX_REGISTRATIONS_PER_IP_PER_DAY = 5;
+const TOKEN_BYTES = 32;
+
+// Canonical wire vocabulary for `{ reason }` error bodies. This is the
+// single source of truth on the Worker side — every jsonResponse({ reason })
+// call below must use one of these, never a raw string literal, so a typo
+// or a forgotten case is a ReferenceError here instead of a silent mismatch
+// with the app's ChatWorkerReason union (clarityai/src/lib/chat-worker.ts,
+// which mirrors this exact list — no cross-repo import is possible since
+// these are two separately deployed projects, so keep the two in sync by
+// hand and cross-reference this comment when either changes).
+const REASON = {
+  INVALID_TOKEN: 'invalid_token',
+  DAILY_LIMIT: 'daily_limit',
+  NO_CREDITS: 'no_credits',
+  CAPACITY: 'capacity',
+  MAINTENANCE: 'maintenance',
+  RATE_LIMITED: 'rate_limited',
+  INVALID_BODY: 'invalid_body',
+  UPSTREAM: 'upstream',
 };
 
 const BASE_PERSONA = `You are ClarityAI, a warm, grounded assistant. You help the user think
@@ -73,6 +112,164 @@ function buildSystemPrompt(connectedContext, lang, customInstructions, responseL
   return prompt;
 }
 
+function jsonResponse(body, status) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...CORS, 'Content-Type': 'application/json' },
+  });
+}
+
+function todayUTC() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function secondsUntilNextUTCMidnight() {
+  const now = new Date();
+  const next = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1);
+  return Math.ceil((next - now.getTime()) / 1000);
+}
+
+function mintToken() {
+  const bytes = crypto.getRandomValues(new Uint8Array(TOKEN_BYTES));
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function loadTokenRecord(env, token) {
+  const raw = await env.QUOTA_KV.get(`token:${token}`);
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function saveTokenRecord(env, token, record) {
+  return env.QUOTA_KV.put(`token:${token}`, JSON.stringify(record));
+}
+
+// Mints a fresh device token, rate-limited by IP so one IP can't mint
+// unbounded tokens to sidestep per-device quotas. Not auth-gated itself —
+// this is the thing that hands out auth.
+async function handleRegister(request, env) {
+  const ip = request.headers.get('CF-Connecting-IP') || 'unknown';
+  const date = todayUTC();
+  const mintKey = `mint:${ip}:${date}`;
+
+  const currentRaw = await env.QUOTA_KV.get(mintKey);
+  const current = currentRaw ? parseInt(currentRaw, 10) : 0;
+
+  if (current >= MAX_REGISTRATIONS_PER_IP_PER_DAY) {
+    console.log(`MINT_RATE ip=${ip} date=${date} count=${current} result=rejected`);
+    return jsonResponse({ reason: REASON.RATE_LIMITED }, 429);
+  }
+
+  const token = mintToken();
+  const record = {
+    createdAt: new Date().toISOString(),
+    freeDate: date,
+    freeCount: 0,
+    credits: 0,
+    revoked: false,
+  };
+
+  await Promise.all([
+    saveTokenRecord(env, token, record),
+    env.QUOTA_KV.put(mintKey, String(current + 1), { expirationTtl: secondsUntilNextUTCMidnight() + 60 }),
+  ]);
+
+  console.log(`MINT_RATE ip=${ip} date=${date} count=${current + 1} result=minted`);
+  return jsonResponse({ token }, 200);
+}
+
+async function handleChat(request, env) {
+  const killSwitch = await env.QUOTA_KV.get('killswitch');
+  if (killSwitch) {
+    return jsonResponse({ reason: REASON.MAINTENANCE }, 503);
+  }
+
+  const auth = request.headers.get('Authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length).trim() : null;
+  if (!token) {
+    return jsonResponse({ reason: REASON.INVALID_TOKEN }, 401);
+  }
+
+  const record = await loadTokenRecord(env, token);
+  if (!record || record.revoked) {
+    return jsonResponse({ reason: REASON.INVALID_TOKEN }, 401);
+  }
+
+  const date = todayUTC();
+  if (record.freeDate !== date) {
+    record.freeDate = date;
+    record.freeCount = 0;
+  }
+
+  const hasCredits = record.credits > 0;
+  const hasFreeLeft = record.freeCount < FREE_DAILY_LIMIT;
+
+  if (!hasCredits && !hasFreeLeft) {
+    return jsonResponse({ reason: REASON.DAILY_LIMIT }, 429);
+  }
+
+  const spendKey = `spend:${date}`;
+  const spendRaw = await env.QUOTA_KV.get(spendKey);
+  const spend = spendRaw ? parseInt(spendRaw, 10) : 0;
+
+  // Paying (credit-spending) requests are exempt from the capacity gate —
+  // free traffic must never be able to starve a device that bought credits.
+  if (!hasCredits && spend >= DAILY_AI_BUDGET * CAPACITY_RESERVE_THRESHOLD) {
+    return jsonResponse({ reason: REASON.CAPACITY }, 503);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return jsonResponse({ reason: REASON.INVALID_BODY }, 400);
+  }
+
+  const { messages, connectedContext, lang, customInstructions, responseLength } = body;
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return jsonResponse({ reason: REASON.INVALID_BODY }, 400);
+  }
+
+  const chatMessages = [
+    { role: 'system', content: buildSystemPrompt(connectedContext, lang, customInstructions, responseLength) },
+    ...messages,
+  ];
+
+  let stream;
+  try {
+    stream = await env.AI.run(env.AI_MODEL, { messages: chatMessages, stream: true });
+  } catch (err) {
+    console.error('Workers AI error:', err.message);
+    return jsonResponse({ reason: REASON.UPSTREAM }, 502);
+  }
+
+  // Debit only on a successful call — a failed upstream call shouldn't cost
+  // the device its free message or a credit.
+  if (hasCredits) {
+    record.credits -= 1;
+  } else {
+    record.freeCount += 1;
+  }
+
+  await Promise.all([
+    saveTokenRecord(env, token, record),
+    env.QUOTA_KV.put(spendKey, String(spend + 1), { expirationTtl: secondsUntilNextUTCMidnight() + 3600 }),
+  ]);
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      ...CORS,
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+    },
+  });
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === 'OPTIONS') {
@@ -80,49 +277,15 @@ export default {
     }
 
     const url = new URL(request.url);
-    if (url.pathname !== '/chat' || request.method !== 'POST') {
-      return new Response('Not Found', { status: 404, headers: CORS });
+
+    if (url.pathname === '/register' && request.method === 'POST') {
+      return handleRegister(request, env);
     }
 
-    // Low-effort deterrent against casual/automated scraping of this public
-    // endpoint's Workers AI usage — not a strong security boundary, since
-    // EXPO_PUBLIC_* values ship in the client bundle and can be extracted.
-    if (env.CLARITYAI_SHARED_SECRET && request.headers.get('X-ClarityAI-Key') !== env.CLARITYAI_SHARED_SECRET) {
-      return new Response('Unauthorized', { status: 401, headers: CORS });
+    if (url.pathname === '/chat' && request.method === 'POST') {
+      return handleChat(request, env);
     }
 
-    let body;
-    try {
-      body = await request.json();
-    } catch {
-      return new Response('Invalid JSON', { status: 400, headers: CORS });
-    }
-
-    const { messages, connectedContext, lang, customInstructions, responseLength } = body;
-    if (!Array.isArray(messages) || messages.length === 0) {
-      return new Response('Missing messages', { status: 400, headers: CORS });
-    }
-
-    const chatMessages = [
-      { role: 'system', content: buildSystemPrompt(connectedContext, lang, customInstructions, responseLength) },
-      ...messages,
-    ];
-
-    let stream;
-    try {
-      stream = await env.AI.run(env.AI_MODEL, { messages: chatMessages, stream: true });
-    } catch (err) {
-      console.error('Workers AI error:', err.message);
-      return new Response('Upstream error', { status: 502, headers: CORS });
-    }
-
-    return new Response(stream, {
-      status: 200,
-      headers: {
-        ...CORS,
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-      },
-    });
+    return new Response('Not Found', { status: 404, headers: CORS });
   },
 };
