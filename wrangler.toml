@@ -2,6 +2,9 @@ name = "clarityai-chat"
 main = "src/index.js"
 compatibility_date = "2026-07-07"
 
+[observability]
+enabled = true
+
 [ai]
 binding = "AI"
 
