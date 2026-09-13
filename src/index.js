@@ -1,6 +1,6 @@
 const CORS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'POST, OPTIONS',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
 };
 
@@ -148,6 +148,20 @@ function saveTokenRecord(env, token, record) {
   return env.QUOTA_KV.put(`token:${token}`, JSON.stringify(record));
 }
 
+// Shared by /chat and /usage so the "new UTC day" reset never drifts between
+// the two call sites — mutates record in place and returns it.
+function resetIfNewDay(record, date) {
+  if (record.freeDate !== date) {
+    record.freeDate = date;
+    record.freeCount = 0;
+  }
+  return record;
+}
+
+function usageFields(record) {
+  return { freeCount: record.freeCount, freeLimit: FREE_DAILY_LIMIT, credits: record.credits };
+}
+
 // Mints a fresh device token, rate-limited by IP so one IP can't mint
 // unbounded tokens to sidestep per-device quotas. Not auth-gated itself —
 // this is the thing that hands out auth.
@@ -179,7 +193,35 @@ async function handleRegister(request, env) {
   ]);
 
   console.log(`MINT_RATE ip=${ip} date=${date} count=${current + 1} result=minted`);
-  return jsonResponse({ token }, 200);
+  // Include the fresh allowance so a brand-new install can show "25/25"
+  // immediately, without a second round-trip to /usage.
+  return jsonResponse({ token, ...usageFields(record) }, 200);
+}
+
+// Read-only — no writes, no debit. Lets the client show a live free-message
+// counter without needing to send (and pay for) a chat message first. The
+// client polls this on screen focus/app-foreground rather than after every
+// send, and decrements its own copy optimistically per successful send
+// instead — halves the KV reads this endpoint would otherwise cost per
+// message, which matters given the account-wide budget concerns above
+// (DAILY_AI_BUDGET). A per-message /chat response header would avoid that
+// resync round-trip but can't show anything before the user's first send of
+// a session, which defeats the point of a counter that's supposed to be
+// visible up front.
+async function handleUsage(request, env) {
+  const auth = request.headers.get('Authorization') || '';
+  const token = auth.startsWith('Bearer ') ? auth.slice('Bearer '.length).trim() : null;
+  if (!token) {
+    return jsonResponse({ reason: REASON.INVALID_TOKEN }, 401);
+  }
+
+  const record = await loadTokenRecord(env, token);
+  if (!record || record.revoked) {
+    return jsonResponse({ reason: REASON.INVALID_TOKEN }, 401);
+  }
+
+  resetIfNewDay(record, todayUTC());
+  return jsonResponse(usageFields(record), 200);
 }
 
 async function handleChat(request, env) {
@@ -200,10 +242,7 @@ async function handleChat(request, env) {
   }
 
   const date = todayUTC();
-  if (record.freeDate !== date) {
-    record.freeDate = date;
-    record.freeCount = 0;
-  }
+  resetIfNewDay(record, date);
 
   const hasCredits = record.credits > 0;
   const hasFreeLeft = record.freeCount < FREE_DAILY_LIMIT;
@@ -284,6 +323,10 @@ export default {
 
     if (url.pathname === '/chat' && request.method === 'POST') {
       return handleChat(request, env);
+    }
+
+    if (url.pathname === '/usage' && request.method === 'GET') {
+      return handleUsage(request, env);
     }
 
     return new Response('Not Found', { status: 404, headers: CORS });
